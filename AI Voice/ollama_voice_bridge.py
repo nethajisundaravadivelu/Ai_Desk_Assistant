@@ -7,6 +7,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 import wave
@@ -20,14 +21,15 @@ HOST = "0.0.0.0"
 PORT = 8000
 OLLAMA_CHAT_URL = "http://127.0.0.1:11434/api/chat"
 OLLAMA_SPEECH_URL = "http://127.0.0.1:11434/v1/audio/speech"
-OLLAMA_CHAT_MODEL = "qwen3:8b"
+OLLAMA_CHAT_MODEL = "llama3.1:8b"
 OLLAMA_SPEECH_MODEL = "lfm3-audio:latest"
+WHISPER_MODEL = "tiny.en"
 MAX_WAV_BYTES = 1_000_000
 INTERRUPT_EVENT = threading.Event()
 REQUEST_ACTIVE = threading.Event()
 
-print("Loading Whisper base.en on CPU (first run may download the model)...", flush=True)
-whisper = WhisperModel("base.en", device="cpu", compute_type="int8")
+print(f"Loading Whisper {WHISPER_MODEL} on CPU (first run may download the model)...", flush=True)
+whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
 print(
     f"Whisper ready. Ollama chat model: {OLLAMA_CHAT_MODEL}; "
     f"speech model: {OLLAMA_SPEECH_MODEL}",
@@ -144,6 +146,7 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
             def speak_segment(text: str) -> None:
                 if not text.strip() or INTERRUPT_EVENT.is_set():
                     return
+                print(f"Generating speech for {len(text.strip())} characters...", flush=True)
                 payload = {
                     "model": OLLAMA_SPEECH_MODEL,
                     "input": text.strip(),
@@ -158,11 +161,15 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
                 )
                 speech_response = urllib.request.urlopen(req, timeout=180)
                 pending = b""
+                audio_started = False
                 try:
                     while not INTERRUPT_EVENT.is_set():
                         data = speech_response.read1(2048)
                         if not data:
                             break
+                        if not audio_started:
+                            print("Speech audio started.", flush=True)
+                            audio_started = True
                         data = pending + data
                         even_length = len(data) & ~1
                         if even_length:
@@ -180,20 +187,24 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
                     {
                         "role": "system",
                         "content": (
-                            "Answer helpfully and in detail. Speak naturally. Keep expanding "
-                            "with relevant information; do not conclude because the listener "
-                            "will interrupt when they want to stop."
+                            "Answer helpfully and naturally in 1 to 4 short sentences. "
+                            "Finish after answering once; do not continue unless asked. "
+                            "For a request for a story, tell a brief complete story."
                         ),
                     },
                     {"role": "user", "content": transcript},
                 ]
+                print(f"Generating reply with {OLLAMA_CHAT_MODEL}...", flush=True)
+                generation_started = time.monotonic()
+                first_text_logged = False
                 while not INTERRUPT_EVENT.is_set():
                     payload = {
                         "model": OLLAMA_CHAT_MODEL,
                         "stream": True,
                         "think": False,
                         "messages": messages,
-                        "options": {"temperature": 0.3, "num_predict": 1024},
+                        "options": {"temperature": 0.3, "num_predict": 160},
+                        "keep_alive": "30m",
                     }
                     req = urllib.request.Request(
                         OLLAMA_CHAT_URL,
@@ -213,13 +224,17 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
                             item = json.loads(line.decode("utf-8"))
                             token = item.get("message", {}).get("content", "")
                             if token:
+                                if not first_text_logged:
+                                    elapsed = time.monotonic() - generation_started
+                                    print(f"First reply text after {elapsed:.1f}s.", flush=True)
+                                    first_text_logged = True
                                 buffered_text += token
                                 turn_text += token
                             while buffered_text:
                                 match = re.search(r"[.!?][\"')\]]?\s", buffered_text)
                                 split_at = match.end() if match else 0
-                                if not split_at and len(buffered_text) >= 240:
-                                    split_at = buffered_text.rfind(" ", 0, 220)
+                                if not split_at and len(buffered_text) >= 80:
+                                    split_at = buffered_text.rfind(" ", 0, 80)
                                 if not split_at:
                                     break
                                 speak_segment(buffered_text[:split_at])
@@ -234,16 +249,8 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
                     if INTERRUPT_EVENT.is_set() or not turn_text.strip():
                         break
                     speak_segment(buffered_text)
-                    messages = [
-                        messages[0],
-                        {"role": "user", "content": transcript},
-                        {"role": "assistant", "content": turn_text[-6000:]},
-                        {
-                            "role": "user",
-                            "content": "Continue with more relevant detail. Do not repeat or conclude.",
-                        },
-                    ]
-        except (BrokenPipeError, ConnectionResetError):
+                    break
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             INTERRUPT_EVENT.set()
             print("ESP32 disconnected; stopping the stream.", flush=True)
         except Exception as exc:
@@ -256,7 +263,7 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
                     trailer = b"X-Interrupted: 1\r\n" if INTERRUPT_EVENT.is_set() else b""
                     self.wfile.write(b"0\r\n" + trailer + b"\r\n")
                     self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     pass
             REQUEST_ACTIVE.clear()
 

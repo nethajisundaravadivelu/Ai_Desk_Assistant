@@ -10,8 +10,8 @@
 const char *WIFI_SSID = "Nethaji";
 const char *WIFI_PASSWORD = "2010PECmc098@@";
 // PC Wi-Fi address; update this if the PC's LAN address changes.
-const char *LOCAL_ASK_URL = "http://192.168.10.209:8000/ask";
-const char *LOCAL_SPEAK_URL = "http://192.168.10.209:8000/speak";
+const char *LOCAL_ASK_URL = "http://192.168.10.193:8000/ask";
+const char *LOCAL_SPEAK_URL = "http://192.168.10.193:8000/speak";
 
 // INMP441: SCK=GPIO5, WS=GPIO6, SD=GPIO4, L/R=GND
 // MAX98357A: BCLK=GPIO5, LRC/WS=GPIO6, DIN=GPIO7, SD=3V3
@@ -39,6 +39,7 @@ AudioOutputI2S *speakerOut = nullptr;
 static int32_t i2sSamples[FRAMES_PER_READ * 2];
 uint8_t *wavBuffer = nullptr;
 bool stopRequestedDuringPlayback = false;
+bool touchInterruptArmed = false;
 
 void showLines(const String &a, const String &b = "", const String &c = "") {
   display.clearBuffer();
@@ -136,7 +137,11 @@ bool interruptionRequested() {
       serialCommand += ch;
     }
   }
-  if (digitalRead(PIN_TOUCH) == HIGH) {
+  if (digitalRead(PIN_TOUCH) == LOW) {
+    // Require a fresh touch after recording starts; the trigger touch may
+    // still be held when the playback stream begins.
+    touchInterruptArmed = true;
+  } else if (touchInterruptArmed) {
     stopRequestedDuringPlayback = true;
     return true;
   }
@@ -165,6 +170,7 @@ bool readChunkLine(WiFiClient *stream, String &line) {
 bool streamAskAndSpeak(const uint8_t *wav, size_t wavLength, bool &interrupted) {
   interrupted = false;
   stopRequestedDuringPlayback = false;
+  touchInterruptArmed = false;
   WiFiClient client;
   HTTPClient http;
   http.setTimeout(180000);
@@ -443,7 +449,8 @@ void setup() {
   }
   showLines("Ready to record", "Type r + Enter");
   Serial.println("Ready. Type r and press Enter, then speak for 2 seconds.");
-  Serial.println("PC bridge: http://192.168.10.209:8000");
+  Serial.print("PC bridge: ");
+  Serial.println(LOCAL_ASK_URL);
 }
 
 void loop() {
