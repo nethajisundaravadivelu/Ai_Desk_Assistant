@@ -5,10 +5,8 @@
 #include <ArduinoJson.h>
 #include <ESP_I2S.h>
 #include <AudioOutputI2S.h>
+#include "wifi_config.h"
 
-// Enter Wi-Fi credentials on your computer only. Never share this completed file.
-const char *WIFI_SSID = "Nethaji";
-const char *WIFI_PASSWORD = "2010PECmc098@@";
 // PC Wi-Fi address; update this if the PC's LAN address changes.
 const char *LOCAL_ASK_URL = "http://192.168.10.193:8000/ask";
 const char *LOCAL_SPEAK_URL = "http://192.168.10.193:8000/speak";
