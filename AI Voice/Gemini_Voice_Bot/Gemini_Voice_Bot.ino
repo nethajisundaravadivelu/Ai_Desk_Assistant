@@ -38,6 +38,15 @@ static int32_t i2sSamples[FRAMES_PER_READ * 2];
 uint8_t *wavBuffer = nullptr;
 bool stopRequestedDuringPlayback = false;
 bool touchInterruptArmed = false;
+constexpr uint8_t FACE_HAPPY = 0;
+constexpr uint8_t FACE_CURIOUS = 1;
+constexpr uint8_t FACE_SURPRISED = 2;
+constexpr uint8_t FACE_SLEEPY = 3;
+uint8_t idleExpression = FACE_HAPPY;
+unsigned long nextIdleExpressionAt = 0;
+unsigned long nextIdleBlinkAt = 0;
+unsigned long idleBlinkEndsAt = 0;
+unsigned long lastSpeakingFaceAt = 0;
 
 void showLines(const String &a, const String &b = "", const String &c = "") {
   display.clearBuffer();
@@ -46,6 +55,107 @@ void showLines(const String &a, const String &b = "", const String &c = "") {
   display.drawUTF8(0, 32, b.c_str());
   display.drawUTF8(0, 50, c.c_str());
   display.sendBuffer();
+}
+
+void drawFace(bool speaking, uint8_t mouthHeight, uint8_t expression, bool blink) {
+  display.clearBuffer();
+
+  if (blink || expression == FACE_SLEEPY) {
+    display.drawLine(29, 25, 53, 25);
+    display.drawLine(75, 25, 99, 25);
+  } else {
+    const int pupilOffset = expression == FACE_CURIOUS ? 4 : 0;
+    const int eyeRadius = expression == FACE_SURPRISED ? 10 : 8;
+    display.drawDisc(41, 25, eyeRadius);
+    display.drawDisc(86, 25, eyeRadius);
+    display.setDrawColor(0);
+    display.drawDisc(41 + pupilOffset, 25, 3);
+    display.drawDisc(86 + pupilOffset, 25, 3);
+    display.setDrawColor(1);
+    if (expression == FACE_SURPRISED) {
+      display.drawLine(30, 10, 52, 10);
+      display.drawLine(76, 10, 98, 10);
+    } else if (expression == FACE_CURIOUS) {
+      display.drawLine(29, 10, 48, 7);
+      display.drawLine(77, 10, 96, 10);
+    }
+  }
+
+  if (speaking) {
+    if (mouthHeight <= 5) {
+      display.drawLine(53, 46, 64, 49);
+      display.drawLine(64, 49, 75, 46);
+    } else {
+      const int height = mouthHeight > 19 ? 19 : mouthHeight;
+      const int radiusY = height / 2;
+      const int radiusX = 4 + height / 3;
+      display.drawFilledEllipse(64, 47, radiusX, radiusY);
+      display.setDrawColor(0);
+      if (radiusY > 2) {
+        display.drawFilledEllipse(64, 47, radiusX - 2, radiusY - 2);
+      }
+      display.setDrawColor(1);
+      if (height >= 11) {
+        display.drawFilledEllipse(64, 47 + radiusY - 2, radiusX / 2, 1);
+      }
+    }
+  } else if (expression == FACE_SURPRISED) {
+    display.drawDisc(64, 48, 7);
+    display.setDrawColor(0);
+    display.drawDisc(64, 48, 4);
+    display.setDrawColor(1);
+  } else if (expression == FACE_CURIOUS) {
+    display.drawLine(55, 47, 64, 49);
+    display.drawLine(64, 49, 73, 45);
+  } else if (expression == FACE_SLEEPY) {
+    display.drawLine(56, 48, 72, 48);
+  } else {
+    display.drawLine(51, 44, 64, 50);
+    display.drawLine(64, 50, 77, 44);
+  }
+
+  display.sendBuffer();
+}
+
+void beginIdleFace() {
+  idleExpression = random(0, 4);
+  nextIdleExpressionAt = millis() + random(3500, 7500);
+  nextIdleBlinkAt = millis() + random(1800, 4200);
+  idleBlinkEndsAt = 0;
+  drawFace(false, 0, idleExpression, false);
+}
+
+void animateIdleFace() {
+  const unsigned long now = millis();
+  bool changed = false;
+  if ((long)(now - nextIdleExpressionAt) >= 0) {
+    idleExpression = random(0, 4);
+    nextIdleExpressionAt = now + random(3500, 7500);
+    changed = true;
+  }
+  if ((long)(now - nextIdleBlinkAt) >= 0) {
+    idleBlinkEndsAt = now + 140;
+    nextIdleBlinkAt = now + random(1800, 4200);
+    changed = true;
+  }
+  if (idleBlinkEndsAt && (long)(now - idleBlinkEndsAt) >= 0) {
+    idleBlinkEndsAt = 0;
+    changed = true;
+  }
+  if (changed) drawFace(false, 0, idleExpression, idleBlinkEndsAt != 0);
+}
+
+void updateSpeakingFace(uint32_t averageAmplitude) {
+  const unsigned long now = millis();
+  if (now - lastSpeakingFaceAt < 90) return;
+  lastSpeakingFaceAt = now;
+  uint8_t mouthHeight = 4;
+  if (averageAmplitude > 250) {
+    mouthHeight = 6 + averageAmplitude / 1500;
+    if (((now / 140) & 1) != 0) mouthHeight += 3;
+  }
+  if (mouthHeight > 19) mouthHeight = 19;
+  drawFace(true, mouthHeight, FACE_HAPPY, false);
 }
 
 void put16(uint8_t *p, uint16_t v) {
@@ -238,8 +348,11 @@ bool streamAskAndSpeak(const uint8_t *wav, size_t wavLength, bool &interrupted) 
         http.end();
         return false;
       }
+      uint64_t magnitudeSum = 0;
+      const size_t sampleCount = got / 2;
       for (size_t i = 0; i < got; i += 2) {
         const int16_t value = (int16_t)((uint16_t)pcm[i] | ((uint16_t)pcm[i + 1] << 8));
+        magnitudeSum += value < 0 ? -(int32_t)value : value;
         int16_t sample[2] = {value, value};
         while (!speakerOut->ConsumeSample(sample)) {
           if (interruptionRequested()) {
@@ -250,6 +363,7 @@ bool streamAskAndSpeak(const uint8_t *wav, size_t wavLength, bool &interrupted) 
           delay(1);
         }
       }
+      updateSpeakingFace(sampleCount ? (uint32_t)(magnitudeSum / sampleCount) : 0);
       remaining -= got;
     }
     // Every HTTP chunk is followed by CRLF before the next hexadecimal size.
@@ -349,7 +463,7 @@ bool restoreMicrophoneMode() {
     return false;
   }
   Serial.println("I2S mic mode restored.");
-  showLines("Ready to record", "Type r + Enter");
+  beginIdleFace();
   Serial.println("Ready. Type r and press Enter for another question.");
   return true;
 }
@@ -381,7 +495,7 @@ void handleRecording() {
       return;
     }
     Serial.println("Streaming local Ollama answer and speech.");
-    showLines("Answer streaming", "Touch or R+Enter", "to interrupt");
+    drawFace(false, 0, FACE_CURIOUS, false);
 
     bool interrupted = false;
     const bool completed = streamAskAndSpeak(wavBuffer, WAV_BYTES, interrupted);
@@ -411,8 +525,10 @@ void handleRecording() {
 void setup() {
   Serial.begin(115200);
   Serial.println("Local Ollama Voice Bot");
+  randomSeed(micros());
   pinMode(PIN_TOUCH, INPUT);
   Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setClock(400000);
   display.setI2CAddress(OLED_ADDRESS * 2);
   display.begin();
 
@@ -445,7 +561,7 @@ void setup() {
     Serial.println("I2S microphone start failed.");
     return;
   }
-  showLines("Ready to record", "Type r + Enter");
+  beginIdleFace();
   Serial.println("Ready. Type r and press Enter, then speak for 2 seconds.");
   Serial.print("PC bridge: ");
   Serial.println(LOCAL_ASK_URL);
@@ -468,4 +584,5 @@ void loop() {
   } else if (!touchActive) {
     touchWasActive = false;
   }
+  animateIdleFace();
 }
